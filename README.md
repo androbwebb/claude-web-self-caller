@@ -4,6 +4,12 @@ A small CLI that drives **Claude Code remote web sessions** from another Claude 
 
 The point: a Claude Code session that can **spawn and coordinate other Claude Code sessions**. Delegate bounded sub-tasks to fresh sandboxes, run work against a different repo, or fan out parallel sub-agents — then read the answers back as plain strings you can pipe into the next command.
 
+
+
+https://github.com/user-attachments/assets/87d533c8-1c5d-43a7-a8d6-de9286c4cc1c
+
+
+
 ```bash
 sid=$(remote-session create owner/repo env_01Xxx "Explore this codebase" | jq -r .id)
 remote-session send   "$sid" "What's the test framework?"
