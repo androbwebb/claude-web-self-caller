@@ -4,9 +4,9 @@
 # Paste this into your Claude Code environment's setup script (or invoke via
 # curl | bash from a larger setup script):
 #
-#   curl -fsSL https://raw.githubusercontent.com/androbwebb/mr-clawsworth/main/scripts/env-install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/androbwebb/claude-web-self-caller/main/scripts/env-install.sh | bash
 #
-# Also set this env var in the environment config so the orgUUID lookup
+# Also you can set this env var in the environment config so the orgUUID lookup
 # doesn't have to hit /api/oauth/profile (which needs user:profile scope):
 #
 #   CLAUDE_CODE_ORGANIZATION_UUID=<your-org-uuid>
@@ -16,7 +16,7 @@
 #   - Claude's Bash tool (via BASH_ENV, so `bash -c '...'` preloads it)
 set -euo pipefail
 
-RAW_URL="${REMOTE_SESSION_RAW_URL:-https://raw.githubusercontent.com/androbwebb/mr-clawsworth/main/scripts/remote-session.sh}"
+RAW_URL="${REMOTE_SESSION_RAW_URL:-https://raw.githubusercontent.com/androbwebb/claude-web-self-caller/main/scripts/remote-session.sh}"
 INSTALL_PATH="${REMOTE_SESSION_INSTALL_PATH:-$HOME/.remote-session.sh}"
 
 echo "[env-install] fetching $RAW_URL"
