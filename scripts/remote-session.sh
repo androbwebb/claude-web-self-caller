@@ -3,7 +3,7 @@
 # call `remote-session <cmd> [args]` in any Claude Code session.
 #
 # Install from an environment setup script:
-#   curl -fsSL https://raw.githubusercontent.com/androbwebb/mr-clawsworth/main/scripts/remote-session.sh \
+#   curl -fsSL https://raw.githubusercontent.com/androbwebb/claude-web-self-caller/main/scripts/remote-session.sh \
 #     -o ~/.remote-session.sh
 #   echo '[ -f ~/.remote-session.sh ] && . ~/.remote-session.sh' >> ~/.bashrc
 #
