@@ -1,131 +1,157 @@
 # claude-web-self-caller
 
-A tiny CLI for launching and driving [Claude Code](https://claude.ai/code) **remote web sessions** from another Claude web session (or a shell somewhere) — using the same private API the official `claude --remote` CLI uses.
+A small CLI that drives **Claude Code remote web sessions** from another Claude session (or any shell) — using the same private API the `claude --remote` CLI uses.
 
-Think of it as a synchronous LLM-agent call with full repo access, tool use, and an answer you can pipe into the next command.
+The point: a Claude Code session that can **spawn and coordinate other Claude Code sessions**. Delegate bounded sub-tasks to fresh sandboxes, run work against a different repo, or fan out parallel sub-agents — then read the answers back as plain strings you can pipe into the next command.
 
 ```bash
-remote-session execute androbwebb/my-repo env_01Xxx "What tech stack does this project use?"
-# => Next.js 16 + React 19 + TypeScript with Prisma/Neon Postgres, Clerk auth, Stripe, and MDX content.
+sid=$(remote-session create owner/repo env_01Xxx "Explore this codebase" | jq -r .id)
+remote-session send   "$sid" "What's the test framework?"
+remote-session events "$sid" 5          # stream recent events
+remote-session wait   "$sid"            # block until done, print final text
+remote-session archive "$sid"
 ```
 
-## What it does
+## How it works
 
-- **Spawn** a fresh Claude Code session on any environment, against any GitHub repo, with an initial prompt
-- **Send** follow-up prompts into an existing session
-- **Wait** for a session to finish and read back Claude's answer
-- **Inspect** live event streams (assistant text, tool calls, thinking blocks, env logs)
-- **Archive** sessions when you're done
+Each `remote-session` is a real Claude Code worker running in an Anthropic cloud sandbox against a GitHub repo you choose. The CLI is a thin wrapper over four REST calls on `api.anthropic.com`:
 
-All against `api.anthropic.com` with an OAuth bearer token. No browser cookies, no web scraping.
-
-## Two flavors
-
-| File | When to use it |
+| REST call | What it does |
 | --- | --- |
-| `remote-session.sh` | Source into bash. Needs `curl` + `jq`. Zero Node deps. Best for env setup scripts. |
-| `remote-session.ts` | Run via `tsx`. Needs Node 20+. Best if you want typed imports. |
+| `POST /v1/sessions` | Spin up a new worker with an initial prompt |
+| `POST /v1/sessions/{id}/events` | Send a follow-up user message |
+| `GET  /v1/sessions/{id}/events` | Poll for assistant responses, tool calls, and the terminal `result` event |
+| `POST /v1/sessions/{id}/archive` | Clean up when done |
 
-## Quick start (local)
-
-Bash:
-
-```bash
-source ./remote-session.sh
-export CLAUDE_CODE_ORGANIZATION_UUID=<your-org-uuid>
-remote-session envs
-remote-session execute owner/repo env_01Xxx "summarize the README in one sentence"
-```
-
-TypeScript:
-
-```bash
-npx tsx remote-session.ts envs
-npx tsx remote-session.ts execute owner/repo env_01Xxx "summarize the README in one sentence"
-```
-
-Or import:
-
-```ts
-import { createSession, sendPrompt, waitForResult, executePrompt } from "./remote-session";
-
-const { sessionId, finalText } = await executePrompt({
-  repo: "owner/repo",
-  environmentId: "env_01Xxx",
-  prompt: "summarize the README in one sentence",
-});
-```
-
-## Install into a Claude Code environment
-
-So every session that env spins up has `remote-session` preloaded:
-
-**Environment setup script:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/androbwebb/claude-web-self-caller/scripts/env-install.sh | bash
-```
-
-**Environment variables:**
-
-```
-CLAUDE_CODE_ORGANIZATION_UUID=<your-org-uuid>
-```
-
-The installer:
-
-- Drops `remote-session.sh` into `$HOME`
-- Sources it from `~/.bashrc` (interactive shells)
-- Sets `BASH_ENV` via `/etc/profile.d/` so Claude's own Bash-tool calls (`bash -c …`) also have the function available — letting a Claude session spawn grandchild sessions
+Auth is an OAuth bearer token read from the host Claude Code sandbox (`/home/claude/.claude/remote/.oauth_token`), plus an `x-organization-uuid` header decoded from the session's ingress JWT. No browser cookies, no scraping.
 
 ## Commands
 
 | Command | Description |
 | --- | --- |
-| `envs` | List available environments |
+| `envs` | List available environments (pick an `env_...` ID once) |
 | `list` | List your sessions |
-| `status <id>` | Full session detail (JSON) |
-| `events <id> [limit]` | Pretty-print recent events |
-| `send <id> "<prompt>"` | Send a follow-up prompt |
-| `wait <id> [timeoutSec]` | Block until session finishes; print final assistant text |
-| `archive <id>` | Archive a session |
-| `create <repo> <envId> "<prompt>" [title]` | Create a new session with initial prompt |
-| `execute <repo> <envId> "<prompt>" [timeoutSec]` | One-shot: create + wait + print |
+| `create <repo> <envId> "<prompt>" [title]` | Create a session with an initial prompt; returns JSON |
+| `send <id> "<prompt>"` | Send a follow-up user message |
+| `events <id> [limit]` | Pretty-print recent events (assistant text, tool calls, errors) |
+| `status <id>` | Full session detail as JSON |
+| `wait <id> [timeoutSec]` | Block until the session emits `result`; print final assistant text |
+| `archive <id>` | Archive the session |
+| `execute <repo> <envId> "<prompt>" [timeoutSec]` | One-shot convenience: create + wait + archive |
 
-## Auth
+`execute` is a shortcut for the common "fire one prompt, get one answer, done" case. For anything multi-turn, inspecting tool calls mid-flight, or running many sessions in parallel, use `create`/`send`/`events`/`wait` directly.
 
-Reads an OAuth bearer token in this order:
+## Two flavors
+
+| File | When to use |
+| --- | --- |
+| `scripts/remote-session.sh` | Source into bash. Needs `curl` + `jq`. Zero Node deps. Best for env setup scripts and hooks. |
+| `scripts/remote-session.ts` | Run via `tsx` (Node 20+). Best if you want typed imports in a TS project. |
+
+## Install into a Claude Code environment
+
+Two options, with different tradeoffs:
+
+### Option A — SessionStart hook (recommended)
+
+Drop a `.claude/hooks/session-start.sh` into the repo you want `remote-session` available in. The hook runs at the start of every Claude Code session and fetches the latest helper from `main`, so you never go stale.
+
+From the target repo's root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/androbwebb/claude-web-self-caller/main/scripts/install-hook.sh | bash
+git add .claude && git commit -m "Add remote-session SessionStart hook"
+```
+
+The installer writes:
+
+- `.claude/hooks/session-start.sh` — fetches `remote-session.sh`, sets `BASH_ENV` via `$CLAUDE_ENV_FILE` so Claude's own `bash -c` tool calls preload the function
+- `.claude/settings.json` — registers the hook (merged into an existing file if present)
+
+Once merged to the repo's default branch, every future session on that repo picks it up.
+
+### Option B — Environment setup script
+
+Install once into a Claude Code environment's filesystem. Good if you want `remote-session` available in every repo that uses that environment, not just one.
+
+Add to your environment's setup script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/androbwebb/claude-web-self-caller/main/scripts/env-install.sh | bash
+```
+
+Optionally set `CLAUDE_CODE_ORGANIZATION_UUID=<your-org-uuid>` in the environment's env vars (skips the JWT/profile lookup).
+
+### Which to pick
+
+| | SessionStart hook | Env setup script |
+| --- | --- | --- |
+| Scope | Per-repo | Per-environment |
+| Runs | Every session start (~0.5s) | Once, at env provisioning |
+| Update cadence | Always latest from `main` | Snapshotted; re-provision to refresh |
+| Requires repo commit | Yes (`.claude/` files) | No |
+| Works across repos | Only where hook is committed | Every repo in that env |
+
+The hook is usually the right default. Use the env script when you can't or don't want to commit to the repo, or when you want a fleet of repos to share one install.
+
+## Local use
+
+If you just want to use it from your laptop shell (no Claude Code in the loop):
+
+```bash
+git clone https://github.com/androbwebb/claude-web-self-caller.git
+source ./claude-web-self-caller/scripts/remote-session.sh
+export CLAUDE_OAUTH_TOKEN=<your-token>
+export CLAUDE_CODE_ORGANIZATION_UUID=<your-org-uuid>
+remote-session envs
+```
+
+TypeScript equivalent:
+
+```bash
+npx tsx scripts/remote-session.ts envs
+```
+
+Or import it:
+
+```ts
+import { createSession, sendPrompt, waitForResult, archiveSession } from "./remote-session";
+
+const { sessionId } = await createSession({
+  repo: "owner/repo",
+  environmentId: "env_01Xxx",
+  prompt: "Explore this codebase",
+});
+await sendPrompt(sessionId, "What's the test framework?");
+const { finalText } = await waitForResult(sessionId);
+await archiveSession(sessionId);
+```
+
+## Auth resolution
+
+**OAuth bearer token**, in order:
 
 1. `$CLAUDE_OAUTH_TOKEN`
-2. `/home/claude/.claude/remote/.oauth_token` (exists inside Claude Code sandboxes)
+2. `/home/claude/.claude/remote/.oauth_token` (present inside Claude Code sandboxes)
 
-Organization UUID, in order:
+**Organization UUID**, in order:
 
 1. `$CLAUDE_CODE_ORGANIZATION_UUID`
-2. `GET /api/oauth/profile` → `organization.uuid` (needs `user:profile` scope — not present on remote-session tokens, so prefer the env var)
+2. Decoded from `/home/claude/.claude/remote/.session_ingress_token` (the session ingress JWT — works inside any Claude Code remote session, no extra scope needed)
+3. `GET /api/oauth/profile` → `organization.uuid` (requires `user:profile` scope, which remote-session tokens typically lack)
 
-## API endpoints used
+## Prompting tips
 
-All on `https://api.anthropic.com`, with headers `anthropic-version: 2023-06-01`, `anthropic-beta: ccr-byoc-2025-07-29`, and `x-organization-uuid`.
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| GET | `/v1/environment_providers` | List environments |
-| GET | `/v1/sessions` | List sessions |
-| POST | `/v1/sessions` | Create session (can include initial prompt in `events[]`) |
-| GET | `/v1/sessions/{id}` | Session detail |
-| GET | `/v1/sessions/{id}/events` | Event stream (supports `?after_id=` for incremental polling) |
-| POST | `/v1/sessions/{id}/events` | Send a user message |
-| POST | `/v1/sessions/{id}/archive` | Archive |
-
-Reverse-engineered from the `claude` CLI binary's JS bundle — not officially documented. Field shapes and endpoints can change without notice.
+- Tell the session exactly what to produce ("respond with only the version number").
+- Scope it tightly — each session starts fresh with no memory of the parent.
+- For read-only tasks, say "do not modify files". For write tasks, say whether you want a PR.
+- The model is hard-coded to `claude-opus-4-7[1m]` in `create`. Edit the script to change it.
 
 ## Caveats
 
-- **Not an official API.** Anthropic can change or disable any of this. Treat it as a fun hack, not production infra.
-- **Token scope.** The OAuth token on a remote session lacks `user:profile` (can't call `/api/oauth/profile` or list GitHub repos via the Anthropic API). Set `CLAUDE_CODE_ORGANIZATION_UUID` directly.
-- **Model field** is hard-coded to `claude-opus-4-7[1m]` in `create`. Edit the script if you want something else.
-- **Env's repo access.** The target repo must be a GitHub repo the environment's GitHub App installation can see. Private repos without the app won't clone.
+- **Not an official API.** Anthropic can change or disable any of this. Treat it as a fun hack, not production infra. Reverse-engineered from the `claude` CLI's JS bundle.
+- **Repo access.** The target repo must be reachable by the environment's GitHub App installation. Private repos without the app won't clone.
+- **Token scope.** Remote-session OAuth tokens lack `user:profile`. Use the JWT fallback (automatic) or set `CLAUDE_CODE_ORGANIZATION_UUID`.
 
 ## License
 
