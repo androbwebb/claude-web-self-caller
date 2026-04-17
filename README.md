@@ -63,7 +63,7 @@ So every session that env spins up has `remote-session` preloaded:
 **Environment setup script:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/androbwebb/claude-web-self-caller/main/env-install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/androbwebb/claude-web-self-caller/scripts/env-install.sh | bash
 ```
 
 **Environment variables:**
