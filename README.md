@@ -1,6 +1,6 @@
 # claude-web-self-caller
 
-A tiny CLI for launching and driving [Claude Code](https://claude.ai/code) **remote sessions** from a shell, script, or another Claude session — using the same private API the official `claude --remote` CLI uses.
+A tiny CLI for launching and driving [Claude Code](https://claude.ai/code) **remote web sessions** from another Claude web session (or a shell somewhere) — using the same private API the official `claude --remote` CLI uses.
 
 Think of it as a synchronous LLM-agent call with full repo access, tool use, and an answer you can pipe into the next command.
 
