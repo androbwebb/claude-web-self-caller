@@ -290,12 +290,13 @@ export async function createSession(
   return { sessionId: json.id, raw: json };
 }
 
-/** One-shot: create a session with a prompt, wait for completion, return text. */
+/** One-shot: create a session with a prompt, wait for completion, archive, return text. */
 export async function executePrompt(
   input: CreateSessionInput & { timeoutMs?: number },
 ): Promise<{ sessionId: string; finalText: string }> {
   const { sessionId } = await createSession(input);
   const { finalText } = await waitForResult(sessionId, { timeoutMs: input.timeoutMs });
+  await archiveSession(sessionId).catch(() => {});
   return { sessionId, finalText };
 }
 
@@ -409,7 +410,7 @@ COMMANDS
   archive <sessionId>                        Archive a session when done
   create  <repo> <envId> "<prompt>" [title]  Create session with initial prompt; returns JSON
   execute <repo> <envId> "<prompt>" [timeoutSec=900]
-                                             One-shot: create + wait + print final text (recommended)
+                                             One-shot: create + wait + print final text + archive (recommended)
 
 TYPICAL FLOW (synchronous, one-shot)
   tsx remote-session.ts envs                 # pick an env_... ID once
