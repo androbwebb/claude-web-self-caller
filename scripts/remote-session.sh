@@ -39,12 +39,34 @@ remote-session() {
     fi
   }
 
+  # Decode the session ingress JWT (present in every remote Claude Code
+  # session) and read organization_uuid from its payload. No API call needed.
+  _rs_org_from_ingress() {
+    local path="${CLAUDE_SESSION_INGRESS_TOKEN_FILE:-/home/claude/.claude/remote/.session_ingress_token}"
+    [ -r "$path" ] || return 1
+    local jwt mid padded uuid
+    jwt=$(tr -d '\n' < "$path")
+    mid=${jwt#*.}; mid=${mid%%.*}
+    [ -n "$mid" ] || return 1
+    # base64url -> base64 (pad to multiple of 4)
+    padded=$(printf '%s' "$mid" | tr '_-' '/+')
+    while [ $(( ${#padded} % 4 )) -ne 0 ]; do padded="${padded}="; done
+    uuid=$(printf '%s' "$padded" | base64 -d 2>/dev/null | jq -r '.organization_uuid // empty' 2>/dev/null)
+    [ -n "$uuid" ] && printf '%s' "$uuid"
+  }
+
   _rs_org() {
     if [ -n "$_RS_ORG_CACHE" ]; then
       printf '%s' "$_RS_ORG_CACHE"; return 0
     fi
     if [ -n "$CLAUDE_CODE_ORGANIZATION_UUID" ]; then
       _RS_ORG_CACHE="$CLAUDE_CODE_ORGANIZATION_UUID"
+      printf '%s' "$_RS_ORG_CACHE"; return 0
+    fi
+    local from_ingress
+    from_ingress=$(_rs_org_from_ingress)
+    if [ -n "$from_ingress" ]; then
+      _RS_ORG_CACHE="$from_ingress"
       printf '%s' "$_RS_ORG_CACHE"; return 0
     fi
     local tok; tok=$(_rs_token) || return 1
@@ -221,20 +243,53 @@ remote-session() {
       ;;
     ""|help|-h|--help)
       cat <<'USAGE'
-remote-session <command> [args]
+remote-session — spawn and drive Claude Code remote sessions from the shell.
 
-Commands:
-  envs                             List available environments
-  list                             List your sessions
-  status  <sessionId>              Full session detail
-  events  <sessionId> [limit]      Pretty-print recent events
-  send    <sessionId> "<prompt>"   Send a follow-up prompt
-  archive <sessionId>              Archive a session
-  create  <repo> <envId> "<prompt>" [title]
-                                   Create a new session with initial prompt
-  wait    <sessionId> [timeoutSec] Block until session finishes; print final assistant text
-  execute <repo> <envId> "<prompt>" [timeoutSec]
-                                   One-shot: create + wait + print final assistant text
+Each session is a real Claude Code worker running in an Anthropic cloud
+sandbox against a GitHub repo you choose. You can delegate work to it and
+read the result back as a string. Tasks usually take 20s–several minutes.
+
+WHEN TO USE
+  - Delegating a bounded sub-task to another Claude session (code research,
+    summarization, multi-file edits in a different repo, etc.)
+  - Anything that needs a fresh sandbox or a different repo than yours
+  - Parallel work: spawn multiple sessions, wait on each
+
+COMMANDS
+  envs                                       List available environments (pick an env_... ID)
+  list                                       List your sessions
+  status  <sessionId>                        Full session detail (JSON)
+  events  <sessionId> [limit]                Pretty-print recent events (assistant text, tool calls)
+  send    <sessionId> "<prompt>"             Send a follow-up prompt to an existing session
+  wait    <sessionId> [timeoutSec=900]       Block until `result` event; print final assistant text
+  archive <sessionId>                        Archive a session when done
+  create  <repo> <envId> "<prompt>" [title]  Create session with initial prompt; returns JSON
+  execute <repo> <envId> "<prompt>" [timeoutSec=900]
+                                             One-shot: create + wait + print final text (recommended)
+
+TYPICAL FLOW (synchronous, one-shot)
+  remote-session envs                        # pick an env_... ID once
+  remote-session execute owner/repo env_01Xxx "Summarize the main README in 3 bullets."
+
+TYPICAL FLOW (async / multi-turn)
+  sid=$(remote-session create owner/repo env_01Xxx "Start exploring" | jq -r .id)
+  remote-session events "$sid"
+  remote-session send   "$sid" "Now open a PR with your findings"
+  remote-session wait   "$sid"
+  remote-session archive "$sid"
+
+PROMPTING TIPS
+  - Tell the session what to produce ("respond with only the version number").
+  - Scope it tightly — each session starts fresh and has no memory.
+  - For read-only tasks, say "do not modify files". For write tasks, say whether
+    you want a PR.
+  - Opus 4.7 1M-context is the default model.
+
+AUTH
+  Token:  $CLAUDE_OAUTH_TOKEN, else /home/claude/.claude/remote/.oauth_token
+  OrgID:  $CLAUDE_CODE_ORGANIZATION_UUID, else decoded from the session
+          ingress JWT (works inside any Claude Code remote session),
+          else GET /api/oauth/profile (needs user:profile scope).
 USAGE
       ;;
     *)
