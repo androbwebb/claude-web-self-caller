@@ -34,10 +34,38 @@ function getToken(): string {
 
 let cachedOrgUuid: string | undefined;
 
+/**
+ * Decode the session ingress JWT (present in every remote Claude Code
+ * session) and read `organization_uuid` from its payload. No API call,
+ * no extra scopes required.
+ */
+function readOrgUuidFromIngressToken(): string | undefined {
+  const path =
+    process.env.CLAUDE_SESSION_INGRESS_TOKEN_FILE ??
+    "/home/claude/.claude/remote/.session_ingress_token";
+  let jwt: string;
+  try {
+    jwt = readFileSync(path, "utf8").trim();
+  } catch {
+    return undefined;
+  }
+  const mid = jwt.split(".")[1];
+  if (!mid) return undefined;
+  try {
+    const json = Buffer.from(mid.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    const payload = JSON.parse(json) as { organization_uuid?: string };
+    return payload.organization_uuid;
+  } catch {
+    return undefined;
+  }
+}
+
 async function getOrgUuid(): Promise<string> {
   if (cachedOrgUuid) return cachedOrgUuid;
   const envOrg = process.env.CLAUDE_CODE_ORGANIZATION_UUID?.trim();
   if (envOrg) return (cachedOrgUuid = envOrg);
+  const fromIngress = readOrgUuidFromIngressToken();
+  if (fromIngress) return (cachedOrgUuid = fromIngress);
   const res = await fetch(`${BASE}/api/oauth/profile`, {
     headers: {
       Authorization: `Bearer ${getToken()}`,
@@ -351,13 +379,62 @@ async function main() {
     }
     const r = await createSession({ repo, environmentId: envId, prompt, title });
     console.log(JSON.stringify(r, null, 2));
+  } else if (cmd === "help" || cmd === "-h" || cmd === "--help" || cmd === undefined) {
+    console.log(HELP_TEXT);
   } else {
-    console.error(
-      "usage: list | envs | status <id> | events <id> [limit] | send <id> <prompt> | wait <id> [timeoutSec] | archive <id> | create <repo> <envId> <prompt> [title] | execute <repo> <envId> <prompt> [timeoutSec]",
-    );
+    console.error(`unknown command: ${cmd}\n\n${HELP_TEXT}`);
     process.exit(1);
   }
 }
+
+const HELP_TEXT = `remote-session — spawn and drive Claude Code remote sessions from the shell.
+
+Each session is a real Claude Code worker running in an Anthropic cloud
+sandbox against a GitHub repo you choose. You can delegate work to it and
+read the result back as a string. Tasks usually take 20s–several minutes.
+
+WHEN TO USE
+  - Delegating a bounded sub-task to another Claude session (code research,
+    summarization, multi-file edits in a different repo, etc.)
+  - Anything that needs a fresh sandbox or a different repo than yours
+  - Parallel work: spawn multiple sessions, wait on each
+
+COMMANDS
+  envs                                       List available environments (pick an env_... ID)
+  list                                       List your sessions
+  status  <sessionId>                        Full session detail (JSON)
+  events  <sessionId> [limit]                Pretty-print recent events (assistant text, tool calls)
+  send    <sessionId> "<prompt>"             Send a follow-up prompt to an existing session
+  wait    <sessionId> [timeoutSec=900]       Block until \`result\` event; print final assistant text
+  archive <sessionId>                        Archive a session when done
+  create  <repo> <envId> "<prompt>" [title]  Create session with initial prompt; returns JSON
+  execute <repo> <envId> "<prompt>" [timeoutSec=900]
+                                             One-shot: create + wait + print final text (recommended)
+
+TYPICAL FLOW (synchronous, one-shot)
+  tsx remote-session.ts envs                 # pick an env_... ID once
+  tsx remote-session.ts execute owner/repo env_01Xxx "Summarize the main README in 3 bullets."
+
+TYPICAL FLOW (async / multi-turn)
+  sid=$(tsx remote-session.ts create owner/repo env_01Xxx "Start exploring" | jq -r .sessionId)
+  tsx remote-session.ts events "$sid"
+  tsx remote-session.ts send   "$sid" "Now open a PR with your findings"
+  tsx remote-session.ts wait   "$sid"
+  tsx remote-session.ts archive "$sid"
+
+PROMPTING TIPS
+  - Tell the session what to produce ("respond with only the version number").
+  - Scope it tightly — each session starts fresh and has no memory.
+  - For read-only tasks, say "do not modify files". For write tasks, say whether
+    you want a PR.
+  - Opus 4.7 1M-context is the default model.
+
+AUTH
+  Token:  $CLAUDE_OAUTH_TOKEN, else /home/claude/.claude/remote/.oauth_token
+  OrgID:  $CLAUDE_CODE_ORGANIZATION_UUID, else decoded from the session
+          ingress JWT (works inside any Claude Code remote session),
+          else GET /api/oauth/profile (needs user:profile scope).
+`;
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((e) => {
