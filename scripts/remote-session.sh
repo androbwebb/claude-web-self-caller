@@ -240,6 +240,9 @@ remote-session() {
       sid=$(_rs_create "$1" "$2" "$3" "" | jq -r '.id') || return 1
       echo "# session $sid" >&2
       _rs_wait "$sid" "$timeout_sec"
+      local rc=$?
+      [ "$rc" -eq 0 ] && _rs_curl POST "/v1/sessions/$sid/archive" '' >/dev/null 2>&1
+      return $rc
       ;;
     ""|help|-h|--help)
       cat <<'USAGE'
@@ -265,7 +268,7 @@ COMMANDS
   archive <sessionId>                        Archive a session when done
   create  <repo> <envId> "<prompt>" [title]  Create session with initial prompt; returns JSON
   execute <repo> <envId> "<prompt>" [timeoutSec=900]
-                                             One-shot: create + wait + print final text (recommended)
+                                             One-shot: create + wait + print final text + archive (recommended)
 
 TYPICAL FLOW (synchronous, one-shot)
   remote-session envs                        # pick an env_... ID once
