@@ -415,8 +415,7 @@ Add these to your Claude Code Remote Environment configuration
 
 EOF
       printf 'CLAUDE_OAUTH_TOKEN=%s\n' "$access"
-      [ -n "$refresh" ]  && printf 'CLAUDE_OAUTH_REFRESH_TOKEN=%s\n' "$refresh"
-      [ -n "$org_uuid" ] && printf 'CLAUDE_CODE_ORGANIZATION_UUID=%s\n' "$org_uuid"
+      [ -n "$refresh" ] && printf 'CLAUDE_OAUTH_REFRESH_TOKEN=%s\n' "$refresh"
 
       cat >&2 <<'EOF'
 
