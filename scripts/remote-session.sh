@@ -71,7 +71,7 @@ remote-session() {
       echo "remote-session: no refresh token (set CLAUDE_OAUTH_REFRESH_TOKEN or run \`remote-session setup-token\`)" >&2
       return 1
     }
-    local body resp status json access new_rt
+    local body resp http_status json access new_rt
     body=$(jq -n \
       --arg gt "refresh_token" \
       --arg rt "$rt" \
@@ -79,10 +79,10 @@ remote-session() {
       '{grant_type:$gt, refresh_token:$rt, client_id:$cid}')
     resp=$(curl -sS -w $'\n%{http_code}' -X POST "$base/v1/oauth/token" \
       -H 'Content-Type: application/json' -d "$body")
-    status=$(printf '%s' "$resp" | tail -n1)
+    http_status=$(printf '%s' "$resp" | tail -n1)
     json=$(printf '%s' "$resp" | sed '$d')
-    if [ "$status" != "200" ]; then
-      echo "remote-session: token refresh failed (HTTP $status). Run \`remote-session setup-token\`." >&2
+    if [ "$http_status" != "200" ]; then
+      echo "remote-session: token refresh failed (HTTP $http_status). Run \`remote-session setup-token\`." >&2
       printf '%s\n' "$json" >&2
       return 1
     fi
@@ -101,10 +101,10 @@ remote-session() {
   # Decode the session ingress JWT (present in every remote Claude Code
   # session) and read organization_uuid from its payload. No API call needed.
   _rs_org_from_ingress() {
-    local path="${CLAUDE_SESSION_INGRESS_TOKEN_FILE:-/home/claude/.claude/remote/.session_ingress_token}"
-    [ -r "$path" ] || return 1
+    local tok_path="${CLAUDE_SESSION_INGRESS_TOKEN_FILE:-/home/claude/.claude/remote/.session_ingress_token}"
+    [ -r "$tok_path" ] || return 1
     local jwt mid padded uuid
-    jwt=$(tr -d '\n' < "$path")
+    jwt=$(tr -d '\n' < "$tok_path")
     mid=${jwt#*.}; mid=${mid%%.*}
     [ -n "$mid" ] || return 1
     # base64url -> base64 (pad to multiple of 4)
@@ -128,37 +128,37 @@ remote-session() {
       _RS_ORG_CACHE="$from_ingress"
       printf '%s' "$_RS_ORG_CACHE"; return 0
     fi
-    local attempt=0 tok body status
+    local attempt=0 tok body http_status
     while :; do
       tok=$(_rs_token) || return 1
       body=$(curl -sS -w $'\n%{http_code}' "$base/api/oauth/profile" \
         -H "Authorization: Bearer $tok" -H "anthropic-version: $version")
-      status=$(printf '%s' "$body" | tail -n1)
+      http_status=$(printf '%s' "$body" | tail -n1)
       body=$(printf '%s' "$body" | sed '$d')
-      if [ "$status" = "200" ]; then
+      if [ "$http_status" = "200" ]; then
         _RS_ORG_CACHE=$(printf '%s' "$body" | jq -r '.organization.uuid')
         printf '%s' "$_RS_ORG_CACHE"
         return 0
       fi
-      if { [ "$status" = "401" ] || [ "$status" = "403" ]; } && [ "$attempt" -eq 0 ]; then
+      if { [ "$http_status" = "401" ] || [ "$http_status" = "403" ]; } && [ "$attempt" -eq 0 ]; then
         attempt=1
         if _rs_refresh_access_token; then
           continue
         fi
       fi
-      echo "remote-session: could not resolve org UUID ($status). Set CLAUDE_CODE_ORGANIZATION_UUID or use a token with user:profile scope." >&2
+      echo "remote-session: could not resolve org UUID ($http_status). Set CLAUDE_CODE_ORGANIZATION_UUID or use a token with user:profile scope." >&2
       return 1
     done
   }
 
   _rs_curl() {
-    local method="$1" path="$2" data="$3"
-    local attempt=0 tok org resp status body
+    local method="$1" req_path="$2" data="$3"
+    local attempt=0 tok org resp http_status body
     while :; do
       tok=$(_rs_token) || return 1
       org=$(_rs_org) || return 1
       if [ -n "$data" ]; then
-        resp=$(curl -sS -w $'\n%{http_code}' -X "$method" "$base$path" \
+        resp=$(curl -sS -w $'\n%{http_code}' -X "$method" "$base$req_path" \
           -H "Authorization: Bearer $tok" \
           -H "anthropic-version: $version" \
           -H "anthropic-beta: $beta" \
@@ -166,15 +166,15 @@ remote-session() {
           -H "content-type: application/json" \
           --data "$data")
       else
-        resp=$(curl -sS -w $'\n%{http_code}' -X "$method" "$base$path" \
+        resp=$(curl -sS -w $'\n%{http_code}' -X "$method" "$base$req_path" \
           -H "Authorization: Bearer $tok" \
           -H "anthropic-version: $version" \
           -H "anthropic-beta: $beta" \
           -H "x-organization-uuid: $org")
       fi
-      status=$(printf '%s' "$resp" | tail -n1)
+      http_status=$(printf '%s' "$resp" | tail -n1)
       body=$(printf '%s' "$resp" | sed '$d')
-      case "$status" in
+      case "$http_status" in
         2*)
           printf '%s' "$body"
           return 0
@@ -187,12 +187,12 @@ remote-session() {
             fi
           fi
           [ -n "$body" ] && printf '%s\n' "$body" >&2
-          echo "remote-session: HTTP $status (token may be invalid or missing scope). Run \`remote-session setup-token\`." >&2
+          echo "remote-session: HTTP $http_status (token may be invalid or missing scope). Run \`remote-session setup-token\`." >&2
           return 1
           ;;
         *)
           [ -n "$body" ] && printf '%s\n' "$body" >&2
-          echo "remote-session: HTTP $status" >&2
+          echo "remote-session: HTTP $http_status" >&2
           return 1
           ;;
       esac
@@ -233,9 +233,9 @@ remote-session() {
     local started=$SECONDS last_id="" body
     local last_assistant=""
     while [ $((SECONDS - started)) -lt "$timeout_sec" ]; do
-      local path="/v1/sessions/$sid/events"
-      if [ -n "$last_id" ]; then path="$path?after_id=$last_id"; fi
-      body=$(_rs_curl GET "$path") || return 1
+      local req_path="/v1/sessions/$sid/events"
+      if [ -n "$last_id" ]; then req_path="$req_path?after_id=$last_id"; fi
+      body=$(_rs_curl GET "$req_path") || return 1
 
       local got_result
       got_result=$(printf '%s' "$body" \
@@ -369,7 +369,7 @@ remote-session() {
         return 1
       fi
 
-      local body resp status json
+      local body resp http_status json
       body=$(jq -n \
         --arg gt "authorization_code" \
         --arg code "$code" \
@@ -380,10 +380,10 @@ remote-session() {
         '{grant_type:$gt, code:$code, state:$state, client_id:$cid, redirect_uri:$ru, code_verifier:$cv}')
       resp=$(curl -sS -w $'\n%{http_code}' -X POST "$base/v1/oauth/token" \
         -H 'Content-Type: application/json' -d "$body")
-      status=$(printf '%s' "$resp" | tail -n1)
+      http_status=$(printf '%s' "$resp" | tail -n1)
       json=$(printf '%s' "$resp" | sed '$d')
-      if [ "$status" != "200" ]; then
-        echo "remote-session: token exchange failed (HTTP $status):" >&2
+      if [ "$http_status" != "200" ]; then
+        echo "remote-session: token exchange failed (HTTP $http_status):" >&2
         printf '%s\n' "$json" >&2
         return 1
       fi
