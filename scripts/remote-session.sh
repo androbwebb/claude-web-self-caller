@@ -9,8 +9,13 @@
 #
 # Auth: reads $CLAUDE_OAUTH_TOKEN, else /home/claude/.claude/remote/.oauth_token.
 # Org UUID: $CLAUDE_CODE_ORGANIZATION_UUID, else GET /api/oauth/profile.
+# Refresh: if $CLAUDE_OAUTH_REFRESH_TOKEN is set, any 401/403 from a session
+#   API call triggers a one-shot refresh + retry.
+# Don't have a token? Run `remote-session setup-token` for an interactive
+# OAuth (PKCE) flow that prints the env vars to add to your Remote
+# Environment configuration.
 #
-# Needs: curl, jq.
+# Needs: curl, jq. `setup-token` also needs openssl.
 
 remote-session() {
   local base="https://api.anthropic.com"
@@ -29,14 +34,68 @@ remote-session() {
   }
 
   _rs_token() {
-    if [ -n "$CLAUDE_OAUTH_TOKEN" ]; then
+    if [ -n "$_RS_ACCESS_CACHE" ]; then
+      printf '%s' "$_RS_ACCESS_CACHE"
+    elif [ -n "$CLAUDE_OAUTH_TOKEN" ]; then
       printf '%s' "$CLAUDE_OAUTH_TOKEN"
     elif [ -r /home/claude/.claude/remote/.oauth_token ]; then
       tr -d '\n' < /home/claude/.claude/remote/.oauth_token
     else
-      echo "remote-session: no token (set CLAUDE_OAUTH_TOKEN)" >&2
+      echo "remote-session: no token (set CLAUDE_OAUTH_TOKEN or run \`remote-session setup-token\`)" >&2
       return 1
     fi
+  }
+
+  # PKCE OAuth client constants (Claude Code public client).
+  _RS_OAUTH_CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+  _RS_OAUTH_REDIRECT_URI="https://platform.claude.com/oauth/code/callback"
+  _RS_OAUTH_AUTH_URL="https://claude.com/cai/oauth/authorize"
+  _RS_OAUTH_SCOPE="user:inference user:sessions:claude_code user:profile"
+
+  _rs_refresh_token() {
+    if [ -n "$_RS_REFRESH_CACHE" ]; then
+      printf '%s' "$_RS_REFRESH_CACHE"
+    elif [ -n "$CLAUDE_OAUTH_REFRESH_TOKEN" ]; then
+      printf '%s' "$CLAUDE_OAUTH_REFRESH_TOKEN"
+    else
+      return 1
+    fi
+  }
+
+  # Mint a new access token from the refresh token. On success caches the new
+  # access token (and any rotated refresh token) in shell vars so subsequent
+  # commands in this shell pick it up without touching env or disk.
+  _rs_refresh_access_token() {
+    local rt
+    rt=$(_rs_refresh_token) || {
+      echo "remote-session: no refresh token (set CLAUDE_OAUTH_REFRESH_TOKEN or run \`remote-session setup-token\`)" >&2
+      return 1
+    }
+    local body resp status json access new_rt
+    body=$(jq -n \
+      --arg gt "refresh_token" \
+      --arg rt "$rt" \
+      --arg cid "$_RS_OAUTH_CLIENT_ID" \
+      '{grant_type:$gt, refresh_token:$rt, client_id:$cid}')
+    resp=$(curl -sS -w $'\n%{http_code}' -X POST "$base/v1/oauth/token" \
+      -H 'Content-Type: application/json' -d "$body")
+    status=$(printf '%s' "$resp" | tail -n1)
+    json=$(printf '%s' "$resp" | sed '$d')
+    if [ "$status" != "200" ]; then
+      echo "remote-session: token refresh failed (HTTP $status). Run \`remote-session setup-token\`." >&2
+      printf '%s\n' "$json" >&2
+      return 1
+    fi
+    access=$(printf '%s' "$json" | jq -r '.access_token // empty')
+    [ -n "$access" ] || { echo "remote-session: refresh response missing access_token" >&2; return 1; }
+    _RS_ACCESS_CACHE="$access"
+    new_rt=$(printf '%s' "$json" | jq -r '.refresh_token // empty')
+    if [ -n "$new_rt" ] && [ "$new_rt" != "$rt" ]; then
+      _RS_REFRESH_CACHE="$new_rt"
+      echo "remote-session: refresh token rotated; update CLAUDE_OAUTH_REFRESH_TOKEN in your Remote Environment to:" >&2
+      printf '  %s\n' "$new_rt" >&2
+    fi
+    return 0
   }
 
   # Decode the session ingress JWT (present in every remote Claude Code
@@ -69,40 +128,75 @@ remote-session() {
       _RS_ORG_CACHE="$from_ingress"
       printf '%s' "$_RS_ORG_CACHE"; return 0
     fi
-    local tok; tok=$(_rs_token) || return 1
-    local body status
-    body=$(curl -sS -w $'\n%{http_code}' "$base/api/oauth/profile" \
-      -H "Authorization: Bearer $tok" -H "anthropic-version: $version")
-    status=$(printf '%s' "$body" | tail -n1)
-    body=$(printf '%s' "$body" | sed '$d')
-    if [ "$status" != "200" ]; then
+    local attempt=0 tok body status
+    while :; do
+      tok=$(_rs_token) || return 1
+      body=$(curl -sS -w $'\n%{http_code}' "$base/api/oauth/profile" \
+        -H "Authorization: Bearer $tok" -H "anthropic-version: $version")
+      status=$(printf '%s' "$body" | tail -n1)
+      body=$(printf '%s' "$body" | sed '$d')
+      if [ "$status" = "200" ]; then
+        _RS_ORG_CACHE=$(printf '%s' "$body" | jq -r '.organization.uuid')
+        printf '%s' "$_RS_ORG_CACHE"
+        return 0
+      fi
+      if { [ "$status" = "401" ] || [ "$status" = "403" ]; } && [ "$attempt" -eq 0 ]; then
+        attempt=1
+        if _rs_refresh_access_token; then
+          continue
+        fi
+      fi
       echo "remote-session: could not resolve org UUID ($status). Set CLAUDE_CODE_ORGANIZATION_UUID or use a token with user:profile scope." >&2
       return 1
-    fi
-    _RS_ORG_CACHE=$(printf '%s' "$body" | jq -r '.organization.uuid')
-    printf '%s' "$_RS_ORG_CACHE"
+    done
   }
 
   _rs_curl() {
     local method="$1" path="$2" data="$3"
-    local tok org
-    tok=$(_rs_token) || return 1
-    org=$(_rs_org) || return 1
-    if [ -n "$data" ]; then
-      curl -sS -X "$method" "$base$path" \
-        -H "Authorization: Bearer $tok" \
-        -H "anthropic-version: $version" \
-        -H "anthropic-beta: $beta" \
-        -H "x-organization-uuid: $org" \
-        -H "content-type: application/json" \
-        --data "$data"
-    else
-      curl -sS -X "$method" "$base$path" \
-        -H "Authorization: Bearer $tok" \
-        -H "anthropic-version: $version" \
-        -H "anthropic-beta: $beta" \
-        -H "x-organization-uuid: $org"
-    fi
+    local attempt=0 tok org resp status body
+    while :; do
+      tok=$(_rs_token) || return 1
+      org=$(_rs_org) || return 1
+      if [ -n "$data" ]; then
+        resp=$(curl -sS -w $'\n%{http_code}' -X "$method" "$base$path" \
+          -H "Authorization: Bearer $tok" \
+          -H "anthropic-version: $version" \
+          -H "anthropic-beta: $beta" \
+          -H "x-organization-uuid: $org" \
+          -H "content-type: application/json" \
+          --data "$data")
+      else
+        resp=$(curl -sS -w $'\n%{http_code}' -X "$method" "$base$path" \
+          -H "Authorization: Bearer $tok" \
+          -H "anthropic-version: $version" \
+          -H "anthropic-beta: $beta" \
+          -H "x-organization-uuid: $org")
+      fi
+      status=$(printf '%s' "$resp" | tail -n1)
+      body=$(printf '%s' "$resp" | sed '$d')
+      case "$status" in
+        2*)
+          printf '%s' "$body"
+          return 0
+          ;;
+        401|403)
+          if [ "$attempt" -eq 0 ]; then
+            attempt=1
+            if _rs_refresh_access_token; then
+              continue
+            fi
+          fi
+          [ -n "$body" ] && printf '%s\n' "$body" >&2
+          echo "remote-session: HTTP $status (token may be invalid or missing scope). Run \`remote-session setup-token\`." >&2
+          return 1
+          ;;
+        *)
+          [ -n "$body" ] && printf '%s\n' "$body" >&2
+          echo "remote-session: HTTP $status" >&2
+          return 1
+          ;;
+      esac
+    done
   }
 
   _rs_create() {
@@ -244,6 +338,93 @@ remote-session() {
       [ "$rc" -eq 0 ] && _rs_curl POST "/v1/sessions/$sid/archive" '' >/dev/null 2>&1
       return $rc
       ;;
+    setup-token)
+      command -v openssl >/dev/null 2>&1 || { echo "remote-session: setup-token needs openssl" >&2; return 1; }
+      command -v jq >/dev/null 2>&1     || { echo "remote-session: setup-token needs jq" >&2; return 1; }
+
+      _rs_b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+      local verifier challenge state enc_redirect enc_scope auth_url
+      verifier=$(openssl rand 64 | _rs_b64url)
+      challenge=$(printf '%s' "$verifier" | openssl dgst -sha256 -binary | _rs_b64url)
+      state=$(openssl rand 32 | _rs_b64url)
+      enc_redirect=$(jq -rn --arg s "$_RS_OAUTH_REDIRECT_URI" '$s|@uri')
+      enc_scope=$(jq -rn --arg s "$_RS_OAUTH_SCOPE" '$s|@uri')
+      auth_url="${_RS_OAUTH_AUTH_URL}?code=true&client_id=${_RS_OAUTH_CLIENT_ID}&response_type=code&redirect_uri=${enc_redirect}&scope=${enc_scope}&code_challenge=${challenge}&code_challenge_method=S256&state=${state}"
+
+      printf '\nOpen this URL in a browser and authorize Claude Code:\n\n  %s\n\n' "$auth_url" >&2
+      printf 'After approval, the page shows a string of the form  <code>#<state>\nPaste it here: ' >&2
+      local pasted code in_state
+      IFS= read -r pasted || return 1
+      pasted=$(printf '%s' "$pasted" | tr -d '[:space:]')
+      [ -n "$pasted" ] || { echo "remote-session: empty input" >&2; return 1; }
+      code=${pasted%%#*}
+      in_state=${pasted##*#}
+      if [ -z "$code" ] || [ "$code" = "$pasted" ]; then
+        echo "remote-session: pasted value should look like <code>#<state>" >&2
+        return 1
+      fi
+      if [ "$in_state" != "$state" ]; then
+        echo "remote-session: state mismatch (expected $state, got $in_state)" >&2
+        return 1
+      fi
+
+      local body resp status json
+      body=$(jq -n \
+        --arg gt "authorization_code" \
+        --arg code "$code" \
+        --arg state "$state" \
+        --arg cid "$_RS_OAUTH_CLIENT_ID" \
+        --arg ru "$_RS_OAUTH_REDIRECT_URI" \
+        --arg cv "$verifier" \
+        '{grant_type:$gt, code:$code, state:$state, client_id:$cid, redirect_uri:$ru, code_verifier:$cv}')
+      resp=$(curl -sS -w $'\n%{http_code}' -X POST "$base/v1/oauth/token" \
+        -H 'Content-Type: application/json' -d "$body")
+      status=$(printf '%s' "$resp" | tail -n1)
+      json=$(printf '%s' "$resp" | sed '$d')
+      if [ "$status" != "200" ]; then
+        echo "remote-session: token exchange failed (HTTP $status):" >&2
+        printf '%s\n' "$json" >&2
+        return 1
+      fi
+
+      local access refresh org_uuid org_name account_email scope_granted expires_in
+      access=$(printf '%s'        "$json" | jq -r '.access_token // empty')
+      refresh=$(printf '%s'       "$json" | jq -r '.refresh_token // empty')
+      org_uuid=$(printf '%s'      "$json" | jq -r '.organization.uuid // empty')
+      org_name=$(printf '%s'      "$json" | jq -r '.organization.name // empty')
+      account_email=$(printf '%s' "$json" | jq -r '.account.email_address // empty')
+      scope_granted=$(printf '%s' "$json" | jq -r '.scope // empty')
+      expires_in=$(printf '%s'    "$json" | jq -r '.expires_in // empty')
+
+      [ -n "$access" ] || { echo "remote-session: token response missing access_token" >&2; return 1; }
+
+      # Cache for the current shell so subsequent commands use the new token.
+      _RS_ACCESS_CACHE="$access"
+      [ -n "$refresh" ]  && _RS_REFRESH_CACHE="$refresh"
+      [ -n "$org_uuid" ] && _RS_ORG_CACHE="$org_uuid"
+
+      cat >&2 <<EOF
+
+Authorized as ${account_email:-?}  (${org_name:-?})
+  scope:      ${scope_granted:-?}
+  expires_in: ${expires_in:-?}s
+
+Add these to your Claude Code Remote Environment configuration
+(claude.com/settings -> Environments -> <your env> -> Environment variables):
+
+EOF
+      printf 'CLAUDE_OAUTH_TOKEN=%s\n' "$access"
+      [ -n "$refresh" ]  && printf 'CLAUDE_OAUTH_REFRESH_TOKEN=%s\n' "$refresh"
+      [ -n "$org_uuid" ] && printf 'CLAUDE_CODE_ORGANIZATION_UUID=%s\n' "$org_uuid"
+
+      cat >&2 <<'EOF'
+
+The access token expires in 8h; with the refresh token saved, this CLI
+will auto-refresh on 401/403. If refresh ever fails, re-run
+`remote-session setup-token`.
+EOF
+      ;;
     ""|help|-h|--help)
       cat <<'USAGE'
 remote-session — spawn and drive Claude Code remote sessions from the shell.
@@ -269,6 +450,8 @@ COMMANDS
   create  <repo> <envId> "<prompt>" [title]  Create session with initial prompt; returns JSON
   execute <repo> <envId> "<prompt>" [timeoutSec=900]
                                              One-shot: create + wait + print final text + archive (recommended)
+  setup-token                                Interactive OAuth login (PKCE). Prints env vars to add
+                                             to your Remote Environment configuration.
 
 TYPICAL FLOW (synchronous, one-shot)
   remote-session envs                        # pick an env_... ID once
@@ -289,10 +472,14 @@ PROMPTING TIPS
   - Opus 4.7 1M-context is the default model.
 
 AUTH
-  Token:  $CLAUDE_OAUTH_TOKEN, else /home/claude/.claude/remote/.oauth_token
-  OrgID:  $CLAUDE_CODE_ORGANIZATION_UUID, else decoded from the session
-          ingress JWT (works inside any Claude Code remote session),
-          else GET /api/oauth/profile (needs user:profile scope).
+  Token:    $CLAUDE_OAUTH_TOKEN, else /home/claude/.claude/remote/.oauth_token
+  Refresh:  $CLAUDE_OAUTH_REFRESH_TOKEN. When set, any 401/403 from a session
+            API call triggers a one-shot refresh + retry transparently. If
+            refresh fails, re-run `remote-session setup-token`.
+  OrgID:    $CLAUDE_CODE_ORGANIZATION_UUID, else decoded from the session
+            ingress JWT (works inside any Claude Code remote session),
+            else GET /api/oauth/profile (needs user:profile scope).
+  No token? Run `remote-session setup-token` for an interactive PKCE login.
 USAGE
       ;;
     *)
