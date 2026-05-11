@@ -10,7 +10,11 @@
 # Auth: reads $CLAUDE_OAUTH_TOKEN, else /home/claude/.claude/remote/.oauth_token.
 # Org UUID: $CLAUDE_CODE_ORGANIZATION_UUID, else GET /api/oauth/profile.
 # Refresh: if $CLAUDE_OAUTH_REFRESH_TOKEN is set, any 401/403 from a session
-#   API call triggers a one-shot refresh + retry.
+#   API call triggers a one-shot refresh + retry. On rotation, the new tokens
+#   are written to ~/.remote-session/tokens (so they survive subsequent
+#   `bash -c` invocations in the same session) and POSTed back to the matching
+#   Remote Environment's config via /v1/environment_providers/{id} (so the next
+#   session reads a valid value from $CLAUDE_OAUTH_REFRESH_TOKEN).
 # Don't have a token? Run `remote-session setup-token` for an interactive
 # OAuth (PKCE) flow that prints the env vars to add to your Remote
 # Environment configuration.
@@ -21,6 +25,35 @@ remote-session() {
   local base="https://api.anthropic.com"
   local beta="ccr-byoc-2025-07-29"
   local version="2023-06-01"
+  local _rs_state_dir="${REMOTE_SESSION_STATE_DIR:-$HOME/.remote-session}"
+  local _rs_state_file="$_rs_state_dir/tokens"
+
+  # Persist the in-memory access/refresh tokens to a local state file. Mode 600.
+  # Survives across `bash -c` invocations within a session, but not across
+  # sessions (sandbox filesystems are ephemeral) — env-config sync handles that.
+  _rs_save_state() {
+    mkdir -p "$_rs_state_dir" 2>/dev/null || return 1
+    ( umask 077
+      {
+        [ -n "$_RS_ACCESS_CACHE" ]  && printf 'access=%s\n'  "$_RS_ACCESS_CACHE"
+        [ -n "$_RS_REFRESH_CACHE" ] && printf 'refresh=%s\n' "$_RS_REFRESH_CACHE"
+      } > "$_rs_state_file"
+    )
+  }
+
+  # Load access/refresh from state file into cache vars if not already set.
+  # Called at the top of every `remote-session` invocation so a fresh shell
+  # picks up tokens from an earlier `bash -c` in the same session.
+  _rs_load_state() {
+    [ -r "$_rs_state_file" ] || return 1
+    local k v
+    while IFS='=' read -r k v; do
+      case "$k" in
+        access)  [ -z "$_RS_ACCESS_CACHE" ]  && _RS_ACCESS_CACHE="$v" ;;
+        refresh) [ -z "$_RS_REFRESH_CACHE" ] && _RS_REFRESH_CACHE="$v" ;;
+      esac
+    done < "$_rs_state_file"
+  }
 
   _rs_uuid() {
     if command -v uuidgen >/dev/null 2>&1; then
@@ -62,9 +95,53 @@ remote-session() {
     fi
   }
 
+  # Find every Remote Environment whose CLAUDE_OAUTH_REFRESH_TOKEN equals
+  # $old_rt and POST back the env config with the rotated tokens substituted in.
+  # The list endpoint returns envs with config=null, so we GET each env_id and
+  # match on its full config. Silent on success; returns non-zero if no env was
+  # updated (caller logs a warning).
+  _rs_sync_env_config() {
+    local old_rt="$1" new_rt="$2" new_access="$3"
+    local org list_resp env_ids env_resp body code updated=0 e got_rt
+    org=$(_rs_org) || return 1
+    list_resp=$(curl -sS "$base/v1/environment_providers" \
+      -H "Authorization: Bearer $new_access" \
+      -H "anthropic-version: $version" \
+      -H "anthropic-beta: $beta" \
+      -H "x-organization-uuid: $org") || return 1
+    env_ids=$(printf '%s' "$list_resp" | jq -r '.environments[]?.environment_id // empty' 2>/dev/null)
+    [ -n "$env_ids" ] || return 1
+    for e in $env_ids; do
+      env_resp=$(curl -sS "$base/v1/environment_providers/$e" \
+        -H "Authorization: Bearer $new_access" \
+        -H "anthropic-version: $version" \
+        -H "anthropic-beta: $beta" \
+        -H "x-organization-uuid: $org") || continue
+      got_rt=$(printf '%s' "$env_resp" | jq -r '.config.environment.CLAUDE_OAUTH_REFRESH_TOKEN // empty' 2>/dev/null)
+      [ "$got_rt" = "$old_rt" ] || continue
+      body=$(printf '%s' "$env_resp" | jq \
+        --arg rt "$new_rt" --arg at "$new_access" \
+        '{name, description: (.description // ""),
+          config: (.config
+            | .environment.CLAUDE_OAUTH_REFRESH_TOKEN = $rt
+            | .environment.CLAUDE_OAUTH_TOKEN = $at)}')
+      code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$base/v1/environment_providers/$e" \
+        -H "Authorization: Bearer $new_access" \
+        -H "anthropic-version: $version" \
+        -H "anthropic-beta: $beta" \
+        -H "x-organization-uuid: $org" \
+        -H 'content-type: application/json' \
+        --data "$body")
+      [ "$code" = "200" ] && updated=$((updated + 1))
+    done
+    [ "$updated" -gt 0 ]
+  }
+
   # Mint a new access token from the refresh token. On success caches the new
-  # access token (and any rotated refresh token) in shell vars so subsequent
-  # commands in this shell pick it up without touching env or disk.
+  # access token (and any rotated refresh token) in shell vars and persists to
+  # ~/.remote-session/tokens. If the refresh token rotated, also POSTs the new
+  # value back to the matching Remote Environment's config so the next session
+  # reads a valid value from $CLAUDE_OAUTH_REFRESH_TOKEN.
   _rs_refresh_access_token() {
     local rt
     rt=$(_rs_refresh_token) || {
@@ -92,8 +169,13 @@ remote-session() {
     new_rt=$(printf '%s' "$json" | jq -r '.refresh_token // empty')
     if [ -n "$new_rt" ] && [ "$new_rt" != "$rt" ]; then
       _RS_REFRESH_CACHE="$new_rt"
-      echo "remote-session: refresh token rotated; update CLAUDE_OAUTH_REFRESH_TOKEN in your Remote Environment to:" >&2
-      printf '  %s\n' "$new_rt" >&2
+    fi
+    _rs_save_state
+    if [ -n "$new_rt" ] && [ "$new_rt" != "$rt" ]; then
+      if ! _rs_sync_env_config "$rt" "$new_rt" "$access" 2>/dev/null; then
+        echo "remote-session: warning — refresh token rotated but could not update Remote Environment config." >&2
+        echo "  This session will work; the next may fail until you re-run \`remote-session setup-token\`." >&2
+      fi
     fi
     return 0
   }
@@ -267,6 +349,10 @@ remote-session() {
     return 1
   }
 
+  # Populate token caches from the session-local state file (if any) before
+  # we touch env vars. Lets a rotated token from a previous `bash -c` survive.
+  _rs_load_state
+
   local cmd="$1"; shift || true
   case "$cmd" in
     envs)
@@ -403,6 +489,9 @@ remote-session() {
       _RS_ACCESS_CACHE="$access"
       [ -n "$refresh" ]  && _RS_REFRESH_CACHE="$refresh"
       [ -n "$org_uuid" ] && _RS_ORG_CACHE="$org_uuid"
+      # Persist to disk so subsequent `bash -c` invocations in this session
+      # pick up the new tokens without re-running this flow.
+      _rs_save_state
 
       cat >&2 <<EOF
 
